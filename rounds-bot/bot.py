@@ -1,12 +1,18 @@
-# bot.py
-# Lion's Crown Rounds Bot (Python + discord.py + SQLite)
-# Workflow:
-#   /round start
-#   /round add owner:<@user> amount:<int> (proof_image:<upload> OR proof_link:<url>)
-#   /round finalize
-# Extras:
-#   /round stats [member]
-#   /round export
+# rounds-bot/bot.py
+# Lion's Crown Rounds Bot (discord.py + SQLite)
+# Features:
+# - /round start, /round add (proof image OR proof link), /round finalize
+# - /round stats, /round export
+# - Permission: ONLY members with the ROUNDS role can use these commands
+#
+# .env / Railway Variables needed:
+#   DISCORD_TOKEN=...
+#   GUILD_ID=...               (server id for fast slash sync; optional but recommended)
+#   LOG_CHANNEL_ID=...         (channel id where finalized rounds are posted)
+#   ROUNDS_ROLE_ID=...         (role id allowed to run rounds; REQUIRED)
+#
+# Optional:
+#   (none)
 
 import os
 import csv
@@ -22,14 +28,16 @@ import aiosqlite
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))                 # your server ID
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))     # channel where finalized logs post
-STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "0"))       # role allowed to run commands (0 = allow all)
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # server ID for fast sync
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+
+# Only members with this role can run rounds commands
+ROUNDS_ROLE_ID = int(os.getenv("ROUNDS_ROLE_ID", "0"))
 
 DB_PATH = "rounds.db"
 
-CUT_RUNNER = 0.30
 CUT_OWNER = 0.70
+CUT_RUNNER = 0.30
 
 
 def money(n: int) -> str:
@@ -40,28 +48,43 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def is_staff(member: discord.Member) -> bool:
-    if STAFF_ROLE_ID == 0:
-        return True
-    return any(r.id == STAFF_ROLE_ID for r in member.roles)
+def has_rounds_role(member: discord.Member) -> bool:
+    # If not configured, default to "deny" to be safe
+    if ROUNDS_ROLE_ID == 0:
+        return False
+    return any(r.id == ROUNDS_ROLE_ID for r in member.roles)
 
 
-class LionsCrownBot(discord.Client):
+async def require_rounds_role(interaction: discord.Interaction) -> bool:
+    """Returns True if allowed, otherwise sends an ephemeral error and returns False."""
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return False
+
+    if not has_rounds_role(interaction.user):
+        await interaction.response.send_message("❌ You need the **Rounds** role to use rounds commands.", ephemeral=True)
+        return False
+
+    return True
+
+
+class LionsCrownRoundsBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members = True  # requires "Server Members Intent" enabled in Dev Portal
+        intents.members = True  # role checks require members intent (enable in Dev Portal)
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
         await init_db()
 
-        # Fast dev sync to a single guild
+        # Fast guild-only sync (recommended while developing)
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
         else:
+            # Global sync can take longer to propagate
             await self.tree.sync()
 
 
@@ -78,7 +101,7 @@ async def init_db():
         )
         """)
 
-        # proof_url is now NULLABLE so you can store either an uploaded image URL or a user-provided link
+        # proof_url is nullable: can store uploaded image URL OR a user-provided link
         await db.execute("""
         CREATE TABLE IF NOT EXISTS round_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,12 +117,12 @@ async def init_db():
         await db.commit()
 
 
-bot = LionsCrownBot()
+bot = LionsCrownRoundsBot()
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Rounds Bot logged in as {bot.user} (ID: {bot.user.id})")
 
 
 round_group = app_commands.Group(name="round", description="Printer round logging tools")
@@ -130,11 +153,10 @@ async def fetch_round_entries(round_id: int) -> List[Tuple[int, str, int, Option
 
 @round_group.command(name="start", description="Start your round session")
 async def round_start(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await interaction.response.send_message("You don't have permission to start rounds.", ephemeral=True)
+    if not await require_rounds_role(interaction):
         return
 
-    runner = interaction.user
+    runner = interaction.user  # discord.Member
     existing = await get_active_round_id(runner.id)
     if existing:
         await interaction.response.send_message(
@@ -160,7 +182,7 @@ async def round_start(interaction: discord.Interaction):
 
 @round_group.command(name="add", description="Add ONE payout entry to your active round (proof: image OR link)")
 @app_commands.describe(
-    owner="Who you paid",
+    owner="Who you paid (the AFK owner)",
     amount="How much you collected for them (base amount before split)",
     proof_image="Upload a screenshot proof (optional if you provide a link instead)",
     proof_link="Paste a proof link (optional if you upload an image instead)"
@@ -172,11 +194,10 @@ async def round_add(
     proof_image: Optional[discord.Attachment] = None,
     proof_link: Optional[str] = None
 ):
-    if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await interaction.response.send_message("You don't have permission to add entries.", ephemeral=True)
+    if not await require_rounds_role(interaction):
         return
 
-    runner = interaction.user
+    runner = interaction.user  # discord.Member
     round_id = await get_active_round_id(runner.id)
     if not round_id:
         await interaction.response.send_message("You don’t have an active round. Run `/round start` first.", ephemeral=True)
@@ -190,28 +211,25 @@ async def round_add(
         )
         return
 
-    # Prefer uploaded image URL if provided; otherwise use link
     proof_url = proof_image.url if proof_image is not None else proof_link.strip()
-
-    ts = utc_now_iso()
     amt = int(amount)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO round_entries (round_id, created_at_utc, owner_id, owner_name, amount, proof_url)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (round_id, ts, owner.id, owner.display_name, amt, proof_url))
+        """, (round_id, utc_now_iso(), owner.id, owner.display_name, amt, proof_url))
         await db.commit()
 
-    payout = int(round(amt * CUT_OWNER))
-    cut = amt - payout
+    owner_payout = int(round(amt * CUT_OWNER))
+    runner_cut = amt - owner_payout
 
     await interaction.response.send_message(
         f"✅ Added to Round **#{round_id}**:\n"
         f"- Owner: {owner.mention}\n"
         f"- Collected: **{money(amt)}**\n"
-        f"- Owner gets (70%): **{money(payout)}**\n"
-        f"- Runner cut (30%): **{money(cut)}**\n"
+        f"- Owner gets (70%): **{money(owner_payout)}**\n"
+        f"- Runner cut (30%): **{money(runner_cut)}**\n"
         f"- Proof: {proof_url}",
         ephemeral=True
     )
@@ -219,11 +237,10 @@ async def round_add(
 
 @round_group.command(name="finalize", description="Finalize your active round and post the breakdown to the log channel")
 async def round_finalize(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await interaction.response.send_message("You don't have permission to finalize rounds.", ephemeral=True)
+    if not await require_rounds_role(interaction):
         return
 
-    runner = interaction.user
+    runner = interaction.user  # discord.Member
     round_id = await get_active_round_id(runner.id)
     if not round_id:
         await interaction.response.send_message("No active round found. Use `/round start` first.", ephemeral=True)
@@ -248,8 +265,8 @@ async def round_finalize(interaction: discord.Interaction):
 
     # Totals
     total_collected = sum(e[2] for e in entries)
-    total_owner_payout = sum(int(round(e[2] * CUT_OWNER)) for e in entries)
-    total_runner_cut = total_collected - total_owner_payout
+    total_paid_out = sum(int(round(e[2] * CUT_OWNER)) for e in entries)
+    total_runner_cut = total_collected - total_paid_out
 
     # Log channel
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -267,21 +284,19 @@ async def round_finalize(interaction: discord.Interaction):
     )
     embed.add_field(name="Runner", value=runner.mention, inline=False)
     embed.add_field(name="Total Collected", value=money(total_collected), inline=True)
-    embed.add_field(name="Total Paid Out (70%)", value=money(total_owner_payout), inline=True)
+    embed.add_field(name="Total Paid Out (70%)", value=money(total_paid_out), inline=True)
     embed.add_field(name="Runner Cut (30%)", value=money(total_runner_cut), inline=True)
 
     lines = []
     for owner_id, owner_name, amount, proof_url in entries:
         owner_payout = int(round(amount * CUT_OWNER))
         runner_cut = amount - owner_payout
-        if proof_url:
-            proof_part = f"[proof]({proof_url})"
-        else:
-            proof_part = "*no proof*"
+        proof_part = f"[proof]({proof_url})" if proof_url else "*no proof*"
         lines.append(
             f"<@{owner_id}>: collected **{money(amount)}** → paid **{money(owner_payout)}** | cut **{money(runner_cut)}** {proof_part}"
         )
 
+    # Chunk into embed fields to avoid value limits
     chunk, length = [], 0
     for line in lines:
         if length + len(line) + 1 > 950:
@@ -301,11 +316,10 @@ async def round_finalize(interaction: discord.Interaction):
 @round_group.command(name="stats", description="Show stats (how many rounds + totals) for a runner")
 @app_commands.describe(member="Optional member (defaults to you)")
 async def round_stats(interaction: discord.Interaction, member: Optional[discord.Member] = None):
-    if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await interaction.response.send_message("You don't have permission to view stats.", ephemeral=True)
+    if not await require_rounds_role(interaction):
         return
 
-    target = member or interaction.user
+    target = member or interaction.user  # discord.Member
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
@@ -322,23 +336,22 @@ async def round_stats(interaction: discord.Interaction, member: Optional[discord
         """, (target.id,))
         total_collected = (await cur.fetchone())[0] or 0
 
-    owner_payout = int(round(int(total_collected) * CUT_OWNER))
-    runner_cut = int(total_collected) - owner_payout
+    paid_out = int(round(int(total_collected) * CUT_OWNER))
+    runner_cut = int(total_collected) - paid_out
 
     embed = discord.Embed(title="📊 Round Stats")
     embed.add_field(name="Member", value=target.mention, inline=False)
     embed.add_field(name="Finalized Rounds", value=str(rounds_final), inline=True)
     embed.add_field(name="Total Collected", value=money(int(total_collected)), inline=True)
-    embed.add_field(name="Est. Paid Out (70%)", value=money(owner_payout), inline=True)
+    embed.add_field(name="Est. Paid Out (70%)", value=money(paid_out), inline=True)
     embed.add_field(name="Est. Runner Cut (30%)", value=money(runner_cut), inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@round_group.command(name="export", description="Export all rounds + entries as CSV (staff only)")
+@round_group.command(name="export", description="Export all rounds + entries as CSV (Rounds role required)")
 async def round_export(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await interaction.response.send_message("You don't have permission to export.", ephemeral=True)
+    if not await require_rounds_role(interaction):
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -378,6 +391,12 @@ async def round_export(interaction: discord.Interaction):
 bot.tree.add_command(round_group)
 
 if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN in .env")
+    raise RuntimeError("Missing DISCORD_TOKEN in environment variables")
+
+if LOG_CHANNEL_ID == 0:
+    raise RuntimeError("Missing LOG_CHANNEL_ID in environment variables")
+
+if ROUNDS_ROLE_ID == 0:
+    raise RuntimeError("Missing ROUNDS_ROLE_ID in environment variables (required)")
 
 bot.run(TOKEN)
