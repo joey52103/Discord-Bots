@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# local db
+twitch_alerts.db
+*.db
+
+# python junk
+__pycache__/
+*.pyc
+.venv/
+venv/
